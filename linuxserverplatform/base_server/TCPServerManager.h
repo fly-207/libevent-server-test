@@ -12,6 +12,11 @@
 #include <mutex>
 #include <string>
 
+
+const int MAX_PACKAGE_SIZE = 1024 * 8;
+
+
+
 struct event_base;
 struct event;
 struct evconnlistener;
@@ -87,7 +92,9 @@ private:
     // 添加TCPSocketInfo
     void AddTCPSocketInfo(int fd, WorkThreadInfo* workInfo);
     // 最底层处理收到的数据函数
-    virtual bool RecvData(bufferevent* bev);
+    bool RecvData(bufferevent* bev);
+    // 关闭socket
+    bool CloseSocket(bufferevent* bev);
 
 private:
     // 返回 socket 本地的 xx.xx.xx.xx:xxxx 形式的字符串串

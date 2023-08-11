@@ -213,7 +213,7 @@ void CTCPServerManager::ListenerCB(struct evconnlistener* listener, evutil_socke
     lastThreadIndex++;
 }
 
-void CTCPServerManager::ReadCB(struct bufferevent*, void* data)
+void CTCPServerManager::ReadCB(struct bufferevent*bev, void* data)
 {
     WorkThreadInfo* pWorkInfo = (WorkThreadInfo*)data;
     CTCPServerManager* pThis = pWorkInfo->pThis;
@@ -319,70 +319,90 @@ bool CTCPServerManager::RecvData(bufferevent* bev)
 
     struct evbuffer* input = bufferevent_get_input(bev);
 
-    size_t maxSingleRead = Min_(evbuffer_get_length(input), SOCKET_RECV_BUF_SIZE);
+    // 当前读取位置, 方便后面一次性更新
+    evbuffer_ptr buff_ptr = {};
 
-    char buf[maxSingleRead];
+    // 总的字节数
+    size_t nAllSize = evbuffer_get_length(input);
 
-    size_t realAllSize = evbuffer_copyout(input, buf, sizeof(buf));
-    if (realAllSize <= 0)
+    char buff[MAX_PACKAGE_SIZE] = {};
+
+    while (true)
     {
-        return false;
-    }
+        // 剩余字节小于包头
+        if (nAllSize- buff_ptr.pos < sizeof(NetMessageHead))
+            break;
 
-    // 剩余处理数据
-    size_t handleRemainSize = realAllSize;
+        // 消息头
+        NetMessageHead tmpHead = {};
 
-    // 解出包头
-    NetMessageHead* pNetHead = (NetMessageHead*)buf;
+        // 先读取消息头
+        size_t head_size = evbuffer_copyout_from(input, &buff_ptr, &tmpHead, sizeof(NetMessageHead));
+        if (head_size <= sizeof(NetMessageHead))
+            break;
 
-    // 错误判断
-    if (handleRemainSize >= sizeof(NetMessageHead) && pNetHead->uMessageSize > SOCKET_RECV_BUF_SIZE)
-    {
-        // 消息格式不正确
-        CloseSocket(index);
-        ERROR_LOG("close socket 数据包超过缓冲区最大限制,index=%d uMessageSize=%u", index, pNetHead->uMessageSize);
-        return false;
-    }
 
-    // 粘包处理
-    while (handleRemainSize >= sizeof(NetMessageHead) && handleRemainSize >= pNetHead->uMessageSize)
-    {
-        unsigned int messageSize = pNetHead->uMessageSize;
-        if (messageSize > MAX_TEMP_SENDBUF_SIZE)
+        // 包体超过最大长度限制
+        if (tmpHead.uMessageSize > MAX_PACKAGE_SIZE)
         {
-            // 消息格式不正确
-            CloseSocket(index);
-            ERROR_LOG("close socket 超过单包数据最大值,index=%d,messageSize=%u", index, messageSize);
+            CloseSocket(bev);
             return false;
         }
 
-        int realSize = messageSize - sizeof(NetMessageHead);
-        if (realSize < 0)
+        // 包体未完全接收
+        if(nAllSize-buff_ptr.pos-sizeof(NetMessageHead) < tmpHead.uMessageSize)
+            break;
+
+        evbuffer_ptr _tmp_ptr = {};
+        _tmp_ptr.pos = sizeof(NetMessageHead) + buff_ptr.pos;
+
+
+        // 读取包体
+        size_t body_size = evbuffer_copyout_from(input, &_tmp_ptr, &buff, tmpHead.uMessageSize);
+        if (body_size <= tmpHead.uMessageSize)
+            break;
+
+
+        // 粘包处理
+        while (handleRemainSize >= sizeof(NetMessageHead) && handleRemainSize >= pNetHead->uMessageSize)
         {
-            // 数据包不够包头
-            CloseSocket(index);
-            ERROR_LOG("close socket 数据包不够包头");
-            return false;
+            unsigned int messageSize = pNetHead->uMessageSize;
+            if (messageSize > MAX_TEMP_SENDBUF_SIZE)
+            {
+                // 消息格式不正确
+                CloseSocket(index);
+                ERROR_LOG("close socket 超过单包数据最大值,index=%d,messageSize=%u", index, messageSize);
+                return false;
+            }
+
+            int realSize = messageSize - sizeof(NetMessageHead);
+            if (realSize < 0)
+            {
+                // 数据包不够包头
+                CloseSocket(index);
+                ERROR_LOG("close socket 数据包不够包头");
+                return false;
+            }
+
+            void* pData = NULL;
+            if (realSize > 0)
+            {
+                // 没数据就为NULL
+                pData = (void*)(buf + realAllSize - handleRemainSize + sizeof(NetMessageHead));
+            }
+
+            // 派发数据
+            DispatchPacket(bev, index, pNetHead, pData, realSize);
+
+            handleRemainSize -= messageSize;
+
+            pNetHead = (NetMessageHead*)(buf + realAllSize - handleRemainSize);
         }
 
-        void* pData = NULL;
-        if (realSize > 0)
-        {
-            // 没数据就为NULL
-            pData = (void*)(buf + realAllSize - handleRemainSize + sizeof(NetMessageHead));
-        }
+        evbuffer_drain(input, realAllSize - handleRemainSize);
 
-        // 派发数据
-        DispatchPacket(bev, index, pNetHead, pData, realSize);
-
-        handleRemainSize -= messageSize;
-
-        pNetHead = (NetMessageHead*)(buf + realAllSize - handleRemainSize);
+        return true;
     }
-
-    evbuffer_drain(input, realAllSize - handleRemainSize);
-
-    return true;
 }
 
 std::string CTCPServerManager::GetSocketNameIpAndPort(int fd)
@@ -411,3 +431,30 @@ std::string CTCPServerManager::GetSocketPeerIpAndPort(int fd)
     return out;
 }
 
+
+bool CTCPServerManager::CloseSocket(bufferevent *bev)
+{
+    int fd = bufferevent_getfd(bev);
+
+    {
+        std::lock_guard<std::mutex> lck(m_mtxSocketSize);
+        m_uCurSocketSize--;
+
+    }
+
+    {
+        std::lock_guard<std::mutex> lck(m_mtxFd2SocketInfo);
+        m_mapFd2SocketInfo.erase(fd);
+    }
+
+    bufferevent_free(bev);
+
+
+    // 回调业务层
+    if (m_pService)
+    {
+        m_pService->OnSocketCloseEvent(m_nSocketType, fd);
+    }
+
+    return true;
+}
